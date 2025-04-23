@@ -10,3 +10,4 @@ verify_installation.py
 run_voice_transcriber.vbs
 run_app.bat
 app_icon.ico 
+setup.log
