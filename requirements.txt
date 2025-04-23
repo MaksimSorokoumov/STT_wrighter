@@ -1,0 +1,29 @@
+# ========== Порядок установки ==========
+# 1. Установите Python (рекомендуется 3.11):
+#    Убедитесь, что Python установлен и добавлен в PATH.
+#    Скачать можно с https://www.python.org/downloads/
+
+# 2. Создайте и активируйте виртуальное окружение venv:
+#    python -m venv venv
+#    venv\Scripts\activate  # Windows
+#    source venv/bin/activate # Linux/macOS
+
+# 3. Удалите текущий PyTorch и установите версию с CUDA:
+# pip uninstall torch
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# 4. Установите остальные зависимости:
+# pip install -r requirements.txt   
+     
+
+faster-whisper>=0.10.0  # Минимальная версия с поддержкой turbo
+numpy==1.26.4
+sounddevice==0.4.6
+keyboard==0.13.5
+pyautogui==0.9.54
+Pillow==10.2.0
+pystray==0.19.5
+setuptools==69.1.0
+pynput==1.7.6
+pywin32
+onnxruntime-gpu

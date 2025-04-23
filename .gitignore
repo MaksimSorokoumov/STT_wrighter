@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+app.log
+dist/
+*.spec
+models/
+register_pywin32.py
+download_model.py
+verify_installation.py
+run_voice_transcriber.vbs
+run_app.bat
+app_icon.ico 
