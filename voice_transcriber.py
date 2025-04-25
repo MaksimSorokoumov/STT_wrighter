@@ -446,6 +446,8 @@ class TranscriberApp:
         try:
             # Фильтруем нежелательные фразы перед вставкой
             text = self.filter_unwanted_phrases(text)
+            # Убираем лишние пробелы и добавляем один пробел в конце
+            text = text.rstrip() + ' '
             logging.info(f"Текст для вставки: '{text}'")
             
             # Используем метод ввода из конфигурации
