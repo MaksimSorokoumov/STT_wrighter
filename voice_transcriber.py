@@ -449,7 +449,8 @@ class TranscriberApp:
             # Убираем лишние пробелы и добавляем один пробел в конце
             text = text.rstrip() + ' '
             logging.info(f"Текст для вставки: '{text}'")
-            
+            # Активируем окно, симулируя клик для восстановления фокуса ввода
+            pyautogui.click()
             # Используем метод ввода из конфигурации
             if self.input_method == 'direct_input' and WIN32_AVAILABLE:
                 self.insert_via_direct_input(text)
