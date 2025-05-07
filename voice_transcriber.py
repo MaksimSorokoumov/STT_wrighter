@@ -58,36 +58,74 @@ if torch.cuda.is_available():
     logging.info(f"Версия CUDA: {torch.version.cuda}")
     logging.info(f"Устройство CUDA: {torch.cuda.get_device_name(0)}")
 
+# Определяем режимы производительности
+PERFORMANCE_MODES = {
+    'fast': {
+        'model_size': 'medium',
+        'compute_type': 'int8',
+        'beam_size': 2,
+        'vad_filter': True,
+        'char_delay': 0.02
+    },
+    'balanced': {
+        'model_size': 'large-v3',  # Оптимальный вариант для CUDA
+        'compute_type': 'float16',  # Используем float16 так как есть CUDA
+        'beam_size': 3,
+        'vad_filter': True,
+        'char_delay': 0.025
+    },
+    'accurate': {
+        'model_size': 'large-v3-turbo',
+        'compute_type': 'float16',  # Используем float16 так как есть CUDA
+        'beam_size': 5,
+        'vad_filter': False,
+        'char_delay': 0.03
+    }
+}
+
+# Энергетический Voice Activity Detector
+class SimpleVAD:
+    def __init__(self, energy_threshold=0.005, min_silence_duration=1.0, fs=16000):
+        self.energy_threshold = energy_threshold
+        self.min_silence_samples = int(min_silence_duration * fs)
+        self.silence_counter = 0
+        
+    def is_speech(self, audio_chunk):
+        """Определяет, содержит ли аудио фрагмент речь на основе энергии сигнала"""
+        # Рассчитываем энергию сигнала
+        energy = np.mean(np.abs(audio_chunk))
+        
+        if energy < self.energy_threshold:
+            self.silence_counter += len(audio_chunk)
+            # Возвращает True, если молчание не превысило порог
+            return self.silence_counter < self.min_silence_samples
+        else:
+            # Сбрасываем счетчик тишины
+            self.silence_counter = 0
+            return True
+            
+    def reset(self):
+        """Сбрасывает счетчик тишины"""
+        self.silence_counter = 0
+
 class TranscriberApp:
     def __init__(self):
+        # Загружаем настройки перед инициализацией модели
+        self.config = configparser.ConfigParser()
+        self.load_or_create_config()
+        
+        # Выбираем текущий режим производительности
+        self.current_performance_mode = self.config['settings'].get('performance_mode', 'balanced')
+        
+        # Инициализация VAD с настраиваемым порогом энергии
+        vad_threshold = float(self.config['settings'].get('vad_threshold', '0.005'))
+        self.vad = SimpleVAD(energy_threshold=vad_threshold)
+        
+        # Кеш для хранения загруженных моделей 
+        self.model_cache = {}
+        
         # Инициализация модели Whisper с обработкой ошибок CUDA
-        try:
-            # Проверяем доступность CUDA
-            use_cuda = torch.cuda.is_available()
-            compute_type = "float16" if use_cuda else "int8"
-            device = "cuda" if use_cuda else "cpu"
-            
-            # Используем модель large-v3-turbo вместо обычной large-v3
-            model_size = "large-v3-turbo"  # Изменено на turbo-версию
-            
-            self.model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type,
-                download_root=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
-                cpu_threads=6  # Увеличиваем количество потоков CPU
-            )
-            logging.info(f"Модель Whisper инициализирована на устройстве: {device}, тип вычислений: {compute_type}, размер модели: {model_size}")
-        except Exception as e:
-            logging.error(f"Ошибка инициализации модели Whisper: {str(e)}")
-            # Запасной вариант - использовать CPU
-            logging.info("Переключение на CPU модель")
-            self.model = WhisperModel(
-                "medium",  # Используем medium как запасной вариант
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=12  # Увеличиваем количество потоков CPU
-            )
+        self.initialize_whisper_model()
         
         # Настройки аудио
         self.fs = 16000
@@ -97,7 +135,8 @@ class TranscriberApp:
         # Очередь для обработки аудио в реальном времени
         self.audio_queue = queue.Queue()
         # Executor для асинхронной транскрипции
-        self.executor = ThreadPoolExecutor(max_workers=2)  # Увеличиваем количество рабочих потоков
+        max_workers = int(self.config['settings'].get('max_workers', '2'))
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
         # Запускаем отдельный поток для фоновой обработки аудио
         self.start_audio_processing_thread()
         
@@ -105,10 +144,6 @@ class TranscriberApp:
         self.root = Tk()
         self.root.withdraw()  # Скрываем основное окно
         self.setup_recording_indicator()  # Новое: настройка индикатора записи
-        
-        # Добавляем настройки ввода
-        self.config = configparser.ConfigParser()
-        self.load_or_create_config()
         
         # Регистрация настраиваемой горячей клавиши для переключения записи
         self.register_hotkey()
@@ -123,39 +158,160 @@ class TranscriberApp:
             self.root.title("Голосовой транскрайбер")
             self.root.deiconify()  # Показываем основное окно как запасной вариант
 
+    def initialize_whisper_model(self):
+        """Инициализирует модель Whisper для CUDA"""
+        try:
+            # Получаем параметры из текущего режима
+            mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
+            model_size = mode_settings['model_size']
+            compute_type = mode_settings['compute_type']
+            
+            logging.info(f"Инициализация модели: {model_size}, устройство: cuda, тип вычислений: {compute_type}")
+            
+            # Создаем ключ для кеша
+            cache_key = f"{model_size}_{compute_type}"
+            
+            # Проверяем, есть ли модель в кеше
+            if cache_key in self.model_cache:
+                logging.info(f"Используется кешированная модель: {cache_key}")
+                self.model = self.model_cache[cache_key]
+            else:
+                # Создаем новую модель
+                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+                self.model = WhisperModel(
+                    model_size,
+                    device="cuda",
+                    compute_type=compute_type,
+                    download_root=model_path,
+                    cpu_threads=int(self.config['settings'].get('cpu_threads', '6'))
+                )
+                # Кешируем модель для возможного повторного использования
+                self.model_cache[cache_key] = self.model
+                
+            logging.info(f"Модель Whisper инициализирована: {model_size} на CUDA")
+            
+        except Exception as e:
+            logging.error(f"Ошибка инициализации модели Whisper: {str(e)}")
+            # Запасной вариант - использовать CPU
+            logging.info("Переключение на резервную CPU модель")
+            self.model = WhisperModel(
+                "medium",  # Используем medium как запасной вариант
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=12  # Увеличиваем количество потоков CPU
+            )
+
     def setup_systray(self):
-        image = Image.open("icon.png")
-        menu = (item('Выход', self.quit_app),)
-        self.icon = Icon("STT", image, "Голосовой транскрайбер", menu)
-        threading.Thread(target=self.icon.run, daemon=True).start()
+        """Настраивает иконку в системном трее с дополнительными опциями"""
+        try:
+            image = Image.open("icon.png")
+            
+            # Создаем меню с выбором режима производительности
+            menu = (
+                item('Режим: Быстрый', self.switch_to_fast_mode, checked=lambda _: self.current_performance_mode == 'fast'),
+                item('Режим: Сбалансированный', self.switch_to_balanced_mode, checked=lambda _: self.current_performance_mode == 'balanced'),
+                item('Режим: Точный', self.switch_to_accurate_mode, checked=lambda _: self.current_performance_mode == 'accurate'),
+                item('Выход', self.quit_app),
+            )
+            
+            self.icon = Icon("STT", image, "Голосовой транскрайбер", menu)
+            threading.Thread(target=self.icon.run, daemon=True).start()
+        except Exception as e:
+            logging.error(f"Ошибка настройки системного трея: {e}")
+            raise  # Пробрасываем ошибку для обработки в конструкторе
+    
+    def switch_to_fast_mode(self):
+        """Переключает на быстрый режим работы"""
+        self.change_performance_mode('fast')
+    
+    def switch_to_balanced_mode(self):
+        """Переключает на сбалансированный режим работы"""
+        self.change_performance_mode('balanced')
+    
+    def switch_to_accurate_mode(self):
+        """Переключает на точный режим работы"""
+        self.change_performance_mode('accurate')
+    
+    def change_performance_mode(self, mode):
+        """Изменяет режим производительности и переинициализирует модель"""
+        if mode not in PERFORMANCE_MODES:
+            logging.error(f"Неизвестный режим производительности: {mode}")
+            return
+            
+        logging.info(f"Переключение на режим: {mode}")
+        self.current_performance_mode = mode
+        
+        # Обновляем конфигурацию
+        self.config['settings']['performance_mode'] = mode
+        self._save_config()
+        
+        # Обновляем задержку между символами из настроек режима
+        self.char_delay = PERFORMANCE_MODES[mode]['char_delay']
+        
+        # Переинициализируем модель с новыми параметрами
+        self.initialize_whisper_model()
 
     def quit_app(self):
-        self.icon.stop()
+        """Корректно закрывает приложение"""
+        if hasattr(self, 'icon'):
+            self.icon.stop()
+        
         # Корректно завершаем executor
         logging.info("Завершение работы ThreadPoolExecutor...")
         self.executor.shutdown(wait=False)  # wait=False, чтобы не блокировать выход
         logging.info("ThreadPoolExecutor завершен.")
-        self.root.destroy()
+        
+        if hasattr(self, 'root'):
+            self.root.destroy()
+        
         os._exit(0)
 
     def start_recording(self, _):
-        if not self.is_recording:
-            self.is_recording = True
-            self.audio_data = []
-            logging.info("Начало записи...")
+        """Начинает запись аудио"""
+        logging.info(f"Вызван метод start_recording, текущий статус is_recording: {self.is_recording}")
+        
+        # Если уже идет запись, останавливаем ее сначала
+        if self.is_recording:
+            logging.info("Уже идет запись. Останавливаем текущую запись перед началом новой")
+            self.stop_recording(None)
+        
+        # Устанавливаем флаг записи
+        self.is_recording = True
+        
+        # Сбрасываем предыдущие аудио данные
+        self.audio_data = []
+        
+        # Сбрасываем счетчик тишины VAD
+        self.vad.reset()
+        
+        logging.info("Начало записи...")
+        try:
+            # Закрываем предыдущий поток, если он существует
+            if hasattr(self, 'stream') and self.stream is not None:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception as e:
+                    logging.error(f"Ошибка при закрытии предыдущего аудио потока: {e}")
+            
+            # Инициализируем новый поток
             self.stream = sd.InputStream(
                 samplerate=self.fs,
                 channels=1,
                 callback=self.audio_callback
             )
             self.stream.start()
+            
             # Добавляем автоматическую остановку записи
-            self.auto_stop_timer = threading.Timer(self.max_recording_seconds, self.auto_stop_recording)
+            max_seconds = int(self.config['settings'].get('max_recording_seconds', '120'))
+            if hasattr(self, 'auto_stop_timer') and self.auto_stop_timer:
+                self.auto_stop_timer.cancel()
+            self.auto_stop_timer = threading.Timer(max_seconds, self.auto_stop_recording)
             self.auto_stop_timer.start()
-            # Перемещение индикатора к текущей позиции указателя мыши
+            
+            # Настраиваем индикатор записи
             try:
                 x, y = pyautogui.position()
-                # Устанавливаем геометрию и позицию точно по курсору
                 indicator_width = 20
                 indicator_height = 5
                 self.recording_indicator.geometry(f"{indicator_width}x{indicator_height}+{x}+{y}")
@@ -164,28 +320,92 @@ class TranscriberApp:
                 self.blink_indicator()
             except Exception as e:
                 logging.error(f"Ошибка позиционирования индикатора записи: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка при запуске записи: {e}")
+            logging.error(traceback.format_exc())
+            self.is_recording = False
 
     def audio_callback(self, indata, frames, time, status):
+        """Обработчик аудио данных от микрофона с использованием VAD"""
+        # Проверка на ошибки и статус
+        if status:
+            logging.warning(f"Ошибка в аудио коллбэке: {status}")
+            
+        # Проверка, что флаг записи все еще активен
+        if not self.is_recording:
+            # Если флаг сброшен, но коллбэк все еще вызывается, это может быть ошибкой
+            logging.warning("audio_callback вызван, но флаг is_recording=False")
+            return
+            
+        try:
+            audio_chunk = indata.copy()
+            
+            # Используем VAD только если он включен в текущем режиме
+            use_vad = PERFORMANCE_MODES[self.current_performance_mode]['vad_filter']
+            
+            # Добавляем в аудио данные
+            if not use_vad or self.vad.is_speech(audio_chunk):
+                self.audio_data.append(audio_chunk)
+                self.audio_queue.put(audio_chunk)
+            elif len(self.audio_data) > 0 and use_vad:
+                # Если был хотя бы один чанк с речью и сейчас тишина дольше порога
+                if self.vad.silence_counter >= self.vad.min_silence_samples:
+                    # Автоматически останавливаем запись после длительной тишины
+                    logging.info("Обнаружена длительная тишина, автоматическая остановка записи")
+                    threading.Thread(target=self.auto_stop_after_silence).start()
+        except Exception as e:
+            logging.error(f"Ошибка в audio_callback: {e}")
+            logging.error(traceback.format_exc())
+
+    def auto_stop_after_silence(self):
+        """Автоматически останавливает запись после обнаружения тишины"""
+        # Проверяем, что запись все еще идет
         if self.is_recording:
-            self.audio_data.append(indata.copy())
-            self.audio_queue.put(indata.copy())
+            logging.info("Автоматическая остановка записи после обнаружения тишины")
+            self.stop_recording(None)
 
     def stop_recording(self, _):
         """Останавливает запись и обрабатывает аудио"""
-        if self.is_recording:
-            self.is_recording = False
-            if hasattr(self, 'auto_stop_timer') and self.auto_stop_timer:
-                self.auto_stop_timer.cancel()  # Отменяем таймер
+        logging.info(f"Вызван метод stop_recording, текущий статус is_recording: {self.is_recording}")
+        
+        # Проверяем, инициализирован ли стрим и существует ли он
+        stream_exists = hasattr(self, 'stream') and self.stream is not None
+        
+        # Сбрасываем флаг записи в любом случае
+        self.is_recording = False
+        
+        # Отменяем таймер, если он существует
+        if hasattr(self, 'auto_stop_timer') and self.auto_stop_timer:
+            self.auto_stop_timer.cancel()
             
-            self.stream.stop()
-            self.stream.close()
-            self.recording_indicator.withdraw()  # Скрываем индикатор записи
-            
-            logging.info("Обработка аудио...")
-            if not self.audio_data:
-                logging.info("Нет аудио данных, запись пропущена")
-                return
-            
+        # Если стрим существует, останавливаем его
+        if stream_exists:
+            try:
+                self.stream.stop()
+                self.stream.close()
+                logging.info("Аудио стрим успешно остановлен")
+            except Exception as e:
+                logging.error(f"Ошибка при остановке аудио потока: {e}")
+                
+        # Скрываем индикатор записи в любом случае
+        if hasattr(self, 'recording_indicator'):
+            self.recording_indicator.withdraw()
+        
+        # Очищаем очередь аудио для предотвращения фоновой обработки
+        try:
+            while not self.audio_queue.empty():
+                self.audio_queue.get_nowait()
+            logging.info("Очередь аудио очищена")
+        except Exception as e:
+            logging.error(f"Ошибка при очистке очереди аудио: {e}")
+        
+        # Если нет аудио данных, прекращаем обработку
+        if not hasattr(self, 'audio_data') or not self.audio_data:
+            logging.info("Нет аудио данных, запись пропущена")
+            return
+        
+        logging.info("Обработка аудио...")
+        try:
             audio_array = np.concatenate(self.audio_data)
             
             # Добавляем отладочную информацию
@@ -198,6 +418,9 @@ class TranscriberApp:
             
             # Отправляем аудио на транскрипцию
             self.transcribe_and_insert(audio_array)
+        except Exception as e:
+            logging.error(f"Ошибка при обработке аудио: {e}")
+            logging.error(traceback.format_exc())
 
     def transcribe_and_insert(self, audio_np):
         """Распознает речь в аудио и вставляет текст"""
@@ -213,16 +436,15 @@ class TranscriberApp:
             audio_np = audio_np / 32767.0
         
         try:
-            # Получаем размер модели из переменной окружения (если установлена)
-            model_size = os.environ.get("WHISPER_MODEL_SIZE")
-            if model_size:
-                logging.info(f"Используется размер модели из переменной окружения: {model_size}")
+            # Получаем параметры из текущего режима производительности
+            mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
+            beam_size = mode_settings['beam_size']
             
             segments, info = self.model.transcribe(
                 audio_np,
                 language='ru',
-                beam_size=5,
-                vad_filter=False,
+                beam_size=beam_size,
+                vad_filter=False,  # Мы используем свой VAD, поэтому отключаем встроенный
             )
             
             logging.info(f"Detected language: {info.language} with probability {info.language_probability}")
@@ -231,6 +453,8 @@ class TranscriberApp:
             logging.info(f"Распознанный текст: {text}")
             
             if text:
+                # Фильтруем нежелательные фразы перед вставкой
+                text = self.filter_unwanted_phrases(text)
                 self.insert_text(text)
             else:
                 logging.info("Не удалось распознать речь")
@@ -240,6 +464,7 @@ class TranscriberApp:
             logging.error(traceback.format_exc())
 
     def start_audio_processing_thread(self):
+        """Запускает поток для обработки аудио"""
         self.audio_processing_thread = threading.Thread(target=self.process_audio_queue, daemon=True)
         self.audio_processing_thread.start()
 
@@ -251,15 +476,18 @@ class TranscriberApp:
         # Флаг для отслеживания состояния обработки
         is_processing = False
         last_processed_text = ""
+        batch_size = int(self.config['settings'].get('batch_size', '5'))  # Размер пакета аудио фрагментов
         
         while True:
-            # Обрабатываем данные только если есть что обрабатывать и не идёт обработка
-            if not self.audio_queue.empty() and not is_processing:
+            # Обрабатываем данные только если идет запись и есть что обрабатывать
+            if self.is_recording and not self.audio_queue.empty() and not is_processing:
                 chunks = []
-                # Извлекаем все данные из очереди
+                # Извлекаем все данные из очереди с ограничением на размер пакета
                 try:
-                    while not self.audio_queue.empty():
+                    chunk_count = 0
+                    while not self.audio_queue.empty() and chunk_count < batch_size:
                         chunks.append(self.audio_queue.get())
+                        chunk_count += 1
                 except Exception as e:
                     logging.error(f"Ошибка при извлечении данных из очереди: {e}")
                     time.sleep(0.2)
@@ -274,7 +502,7 @@ class TranscriberApp:
                 audio_array = np.concatenate(chunks, axis=0)
                 
                 # Проверяем минимальную длительность
-                if self.is_recording and len(audio_array) < self.fs:
+                if len(audio_array) < self.fs:
                     time.sleep(0.5)
                     continue
                 
@@ -295,6 +523,13 @@ class TranscriberApp:
                 future = self.executor.submit(self.transcribe_and_get_text, audio_array)
                 future.add_done_callback(on_transcription_done)
             else:
+                # Если запись не идет, очищаем очередь
+                if not self.is_recording and not self.audio_queue.empty():
+                    try:
+                        while not self.audio_queue.empty():
+                            self.audio_queue.get_nowait()
+                    except:
+                        pass
                 time.sleep(0.2)
 
     def transcribe_and_get_text(self, audio_np):
@@ -310,15 +545,15 @@ class TranscriberApp:
             if np.max(np.abs(audio_np)) > 1.0:
                 audio_np = audio_np / 32767.0
                 
-            # Получаем настройки модели из конфигурации
-            model_size = self.get_model_size_from_config()
-            is_small_model = model_size in ["tiny", "base", "small", "medium"]
+            # Получаем параметры из текущего режима производительности
+            mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
+            beam_size = mode_settings['beam_size']
             
-            # Настраиваем параметры в зависимости от размера модели
+            # Настраиваем параметры транскрипции
             params = {
                 'language': 'ru',
-                'beam_size': 3 if is_small_model else 5,
-                'vad_filter': False,
+                'beam_size': beam_size,
+                'vad_filter': False,  # Мы используем собственный VAD
                 'initial_prompt': "Это текст на русском языке."
             }
             
@@ -352,17 +587,36 @@ class TranscriberApp:
         если запись не запущена — начинает запись,
         если запись запущена — останавливает запись и запускает транскрипцию.
         """
-        if not self.is_recording:
-            self.start_recording(event)
-        else:
-            self.stop_recording(event)
+        logging.info(f"Вызвана функция toggle_recording, текущий статус записи: {self.is_recording}")
+        
+        # Защита от повторного вызова во время обработки предыдущего
+        if hasattr(self, '_toggle_lock') and self._toggle_lock:
+            logging.info("Игнорирование повторного вызова toggle_recording (блокировка активна)")
+            return
+            
+        try:
+            # Устанавливаем блокировку
+            self._toggle_lock = True
+            
+            if not self.is_recording:
+                self.start_recording(event)
+            else:
+                logging.info("Останавливаем запись по горячей клавише")
+                self.is_recording = False  # Явно устанавливаем флаг перед вызовом stop_recording
+                self.stop_recording(event)
+        finally:
+            # Снимаем блокировку после выполнения
+            self._toggle_lock = False
 
     def auto_stop_recording(self):
+        """Автоматически останавливает запись по истечении максимального времени"""
         if self.is_recording:
-            logging.info(f"Автоматическая остановка записи по истечении {self.max_recording_seconds} секунд")
+            max_seconds = int(self.config['settings'].get('max_recording_seconds', '120'))
+            logging.info(f"Автоматическая остановка записи по истечении {max_seconds} секунд")
             self.stop_recording(None)
 
     def run(self):
+        """Запускает основной цикл приложения"""
         self.root.mainloop()
 
     def ensure_russian_layout(self):
@@ -444,15 +698,14 @@ class TranscriberApp:
     def insert_text(self, text):
         """Вставка текста без использования буфера обмена"""
         try:
-            # Фильтруем нежелательные фразы перед вставкой
-            text = self.filter_unwanted_phrases(text)
             # Убираем лишние пробелы и добавляем один пробел в конце
             text = text.rstrip() + ' '
             logging.info(f"Текст для вставки: '{text}'")
             # Активируем окно, симулируя клик для восстановления фокуса ввода
             pyautogui.click()
+            
             # Используем метод ввода из конфигурации
-            if self.input_method == 'direct_input' and WIN32_AVAILABLE:
+            if self.config['settings'].get('input_method', 'direct_input') == 'direct_input' and WIN32_AVAILABLE:
                 self.insert_via_direct_input(text)
             else:
                 self.insert_via_keyboard(text)
@@ -460,22 +713,25 @@ class TranscriberApp:
             logging.error(f"Ошибка вставки текста: {e}")
 
     def insert_via_keyboard(self, text):
-        """Вставка текста через эмуляцию клавиатуры"""
+        """Вставка текста через эмуляцию клавиатуры с батчингом"""
         try:
             logging.info("Вставка текста через эмуляцию клавиатуры")
             kb = Controller()
-            # Добавляем задержку между символами для более стабильного ввода
-            for char in text:
-                kb.press(char)
-                kb.release(char)
-                # Небольшая задержка для более надежного ввода
+            
+            # Разбиваем на блоки для более эффективного ввода
+            batch_size = 5  # Вводим по 5 символов за раз
+            for i in range(0, len(text), batch_size):
+                batch = text[i:i+batch_size]
+                kb.type(batch)
+                # Небольшая задержка между батчами
                 time.sleep(self.char_delay)
+                
             logging.info(f"Текст '{text}' вставлен через эмуляцию клавиатуры")
         except Exception as e:
             logging.error(f"Ошибка вставки текста через клавиатуру: {e}")
 
     def insert_via_direct_input(self, text):
-        """Вставка текста напрямую через WinAPI (Windows-only)"""
+        """Вставка текста напрямую через WinAPI с оптимизацией батчинга"""
         try:
             if not WIN32_AVAILABLE:
                 raise Exception("WinAPI недоступен")
@@ -484,10 +740,15 @@ class TranscriberApp:
             if hwnd == 0:
                 raise Exception("Не удалось получить активное окно")
             
-            # Преобразование текста в формат для отправки через WM_CHAR
-            for char in text:
-                win32api.SendMessage(hwnd, win32con.WM_CHAR, ord(char), 0)
-                time.sleep(self.char_delay)  # Задержка между символами
+            # Используем батчинг для более эффективной вставки
+            batch_size = 5  # Размер пакета символов
+            for i in range(0, len(text), batch_size):
+                batch = text[i:i+batch_size]
+                # Отправляем пакет символов
+                for char in batch:
+                    win32api.SendMessage(hwnd, win32con.WM_CHAR, ord(char), 0)
+                # Задержка между батчами
+                time.sleep(self.char_delay)
             
             logging.info(f"Текст '{text}' вставлен через WinAPI")
         except Exception as e:
@@ -532,11 +793,13 @@ class TranscriberApp:
                     self.remove_duplicates = config_settings.getboolean('remove_duplicates', True)
                     self.max_recording_seconds = int(config_settings.get('max_recording_seconds', '120'))
                     self.hotkey = config_settings.get('hotkey', 'f8')
+                    self.current_performance_mode = config_settings.get('performance_mode', 'balanced')
                     
                     logging.info(f"Загружены настройки: метод ввода={self.input_method}, "
                                  f"задержка={self.char_delay}, "
                                  f"удаление дубликатов={self.remove_duplicates}, "
-                                 f"горячая клавиша={self.hotkey}")
+                                 f"горячая клавиша={self.hotkey}, "
+                                 f"режим производительности={self.current_performance_mode}")
                 else:
                     self._set_default_settings()
             else:
@@ -552,20 +815,26 @@ class TranscriberApp:
         if 'settings' not in self.config:
             self.config['settings'] = {}
         
-        # Устанавливаем direct_input как метод по умолчанию
+        # Устанавливаем прямой ввод как метод по умолчанию
         self.input_method = 'direct_input' 
-        self.char_delay = 0.03
+        self.char_delay = 0.02  # Уменьшаем задержку для более быстрого ввода
         self.remove_duplicates = True
-        self.max_recording_seconds = 120
+        self.max_recording_seconds = 60  # Уменьшаем до 1 минуты для более быстрой обработки
         self.hotkey = 'f8'  # Горячая клавиша по умолчанию
+        self.current_performance_mode = 'balanced'  # Режим по умолчанию
         
         self.config['settings']['input_method'] = self.input_method
         self.config['settings']['char_delay'] = str(self.char_delay)
         self.config['settings']['remove_duplicates'] = str(self.remove_duplicates)
-        self.config['settings']['model_size'] = 'large-v3-turbo'  # Изменено на turbo-версию
+        self.config['settings']['model_size'] = 'large-v3'  # Используем large-v3 для лучшего баланса
         self.config['settings']['language'] = 'ru'
         self.config['settings']['max_recording_seconds'] = str(self.max_recording_seconds)
         self.config['settings']['hotkey'] = self.hotkey
+        self.config['settings']['performance_mode'] = self.current_performance_mode
+        self.config['settings']['vad_threshold'] = '0.005'
+        self.config['settings']['batch_size'] = '5'
+        self.config['settings']['max_workers'] = '2'
+        self.config['settings']['cpu_threads'] = '8'  # Увеличиваем для лучшей производительности
         
         # Добавляем секцию для нежелательных фраз, если её нет
         if 'unwanted_phrases' not in self.config:
@@ -618,8 +887,6 @@ class TranscriberApp:
             original_text = text
             for phrase in unwanted_phrases:
                 # Используем re.escape для корректной обработки спецсимволов в фразах
-                # Добавляем \b для поиска целых слов/фраз, если это необходимо
-                # Для простоты пока оставим text.replace, но для большей точности можно использовать re.sub
                 text = text.replace(phrase, "")
             
             # Удаляем лишние пробелы, которые могли образоваться после удаления фраз
