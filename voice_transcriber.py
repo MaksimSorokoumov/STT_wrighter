@@ -2,45 +2,18 @@ import sys
 import keyboard
 import sounddevice as sd
 import numpy as np
-from tkinter import *
-from tkinter import ttk
-from PIL import Image, ImageTk
-import torch
-from faster_whisper import WhisperModel
+from tkinter import Tk
 import pyautogui
-from pystray import MenuItem as item, Icon
 import threading
 import os
-from pynput.keyboard import Controller
 import time
 import queue
 from concurrent.futures import ThreadPoolExecutor
 import logging
-import win32con
-import win32api
-import win32gui
-import configparser
 import ctypes
-import re
 import traceback
 
-# Проверка доступности Windows API
-try:
-    import win32con
-    import win32api
-    import win32gui
-    WIN32_AVAILABLE = True
-    
-    # Скрываем консоль при запуске
-    if hasattr(sys, 'frozen'):  # Проверяем, запущено ли приложение как exe
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd != 0:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
-except ImportError:
-    WIN32_AVAILABLE = False
-    logging.warning("pywin32 не установлен. Прямой ввод через WinAPI будет недоступен")
-
-# Настраиваем логирование также в консоль для отладки
+# Настраиваем логирование
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -50,69 +23,53 @@ logging.basicConfig(
     ]
 )
 
+# Проверяем импорт torch для логирования CUDA
+try:
+    import torch
+    HAS_TORCH = True
+    logging.info(f"PyTorch версия: {torch.__version__}")
+except ImportError:
+    HAS_TORCH = False
+    logging.error("PyTorch не установлен!")
+
+# Импортируем созданные модули
+from config_module import PERFORMANCE_MODES, load_or_create_config, save_config
+from audio_processing import SimpleVAD, normalize_audio, filter_unwanted_phrases
+from text_input import insert_text, ensure_russian_layout
+from gui_utils import setup_recording_indicator, blink_indicator, setup_systray
+from speech_recognition import initialize_whisper_model, transcribe_audio
+
+# Проверка доступности Windows API
+try:
+    import win32con
+    WIN32_AVAILABLE = True
+    
+    # Скрываем консоль при запуске
+    if hasattr(sys, 'frozen'):  # Проверяем, запущено ли приложение как exe
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd != 0:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+except ImportError:
+    WIN32_AVAILABLE = False
+    logging.warning("pywin32 не установлен. Некоторые функции будут недоступны")
+
 # Логируем запуск приложения
 logging.info("=== Запуск приложения ===")
 logging.info(f"Рабочая директория: {os.getcwd()}")
-logging.info(f"Доступность CUDA: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    logging.info(f"Версия CUDA: {torch.version.cuda}")
-    logging.info(f"Устройство CUDA: {torch.cuda.get_device_name(0)}")
 
-# Определяем режимы производительности
-PERFORMANCE_MODES = {
-    'fast': {
-        'model_size': 'medium',
-        'compute_type': 'int8',
-        'beam_size': 2,
-        'vad_filter': True,
-        'char_delay': 0.02
-    },
-    'balanced': {
-        'model_size': 'large-v3',  # Оптимальный вариант для CUDA
-        'compute_type': 'float16',  # Используем float16 так как есть CUDA
-        'beam_size': 3,
-        'vad_filter': True,
-        'char_delay': 0.025
-    },
-    'accurate': {
-        'model_size': 'large-v3-turbo',
-        'compute_type': 'float16',  # Используем float16 так как есть CUDA
-        'beam_size': 5,
-        'vad_filter': False,
-        'char_delay': 0.03
-    }
-}
-
-# Энергетический Voice Activity Detector
-class SimpleVAD:
-    def __init__(self, energy_threshold=0.005, min_silence_duration=1.0, fs=16000):
-        self.energy_threshold = energy_threshold
-        self.min_silence_samples = int(min_silence_duration * fs)
-        self.silence_counter = 0
-        
-    def is_speech(self, audio_chunk):
-        """Определяет, содержит ли аудио фрагмент речь на основе энергии сигнала"""
-        # Рассчитываем энергию сигнала
-        energy = np.mean(np.abs(audio_chunk))
-        
-        if energy < self.energy_threshold:
-            self.silence_counter += len(audio_chunk)
-            # Возвращает True, если молчание не превысило порог
-            return self.silence_counter < self.min_silence_samples
-        else:
-            # Сбрасываем счетчик тишины
-            self.silence_counter = 0
-            return True
-            
-    def reset(self):
-        """Сбрасывает счетчик тишины"""
-        self.silence_counter = 0
+# Логируем информацию о CUDA, если torch доступен
+if HAS_TORCH:
+    logging.info(f"Доступность CUDA: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logging.info(f"Версия CUDA: {torch.version.cuda}")
+        logging.info(f"Устройство CUDA: {torch.cuda.get_device_name(0)}")
+else:
+    logging.warning("PyTorch не установлен, CUDA недоступен")
 
 class TranscriberApp:
     def __init__(self):
         # Загружаем настройки перед инициализацией модели
-        self.config = configparser.ConfigParser()
-        self.load_or_create_config()
+        self.config = load_or_create_config()
         
         # Выбираем текущий режим производительности
         self.current_performance_mode = self.config['settings'].get('performance_mode', 'balanced')
@@ -143,14 +100,16 @@ class TranscriberApp:
         # Создание GUI
         self.root = Tk()
         self.root.withdraw()  # Скрываем основное окно
-        self.setup_recording_indicator()  # Новое: настройка индикатора записи
+        
+        # Настройка индикатора записи
+        self.recording_indicator, self.indicator_on_color, self.indicator_off_color = setup_recording_indicator(self.root)
         
         # Регистрация настраиваемой горячей клавиши для переключения записи
         self.register_hotkey()
         
         # Добавляем обработку ошибок для иконки
         try:
-            self.setup_systray()
+            self.icon = setup_systray(self)
         except Exception as icon_error:
             logging.error(f"Ошибка при настройке системного трея: {str(icon_error)}")
             # Создаем запасной вариант без иконки
@@ -159,14 +118,12 @@ class TranscriberApp:
             self.root.deiconify()  # Показываем основное окно как запасной вариант
 
     def initialize_whisper_model(self):
-        """Инициализирует модель Whisper для CUDA"""
+        """Инициализирует модель Whisper для CUDA используя кеширование"""
         try:
             # Получаем параметры из текущего режима
             mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
             model_size = mode_settings['model_size']
             compute_type = mode_settings['compute_type']
-            
-            logging.info(f"Инициализация модели: {model_size}, устройство: cuda, тип вычислений: {compute_type}")
             
             # Создаем ключ для кеша
             cache_key = f"{model_size}_{compute_type}"
@@ -177,49 +134,22 @@ class TranscriberApp:
                 self.model = self.model_cache[cache_key]
             else:
                 # Создаем новую модель
-                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-                self.model = WhisperModel(
-                    model_size,
-                    device="cuda",
+                cpu_threads = int(self.config['settings'].get('cpu_threads', '6'))
+                self.model = initialize_whisper_model(
+                    model_size=model_size,
                     compute_type=compute_type,
-                    download_root=model_path,
-                    cpu_threads=int(self.config['settings'].get('cpu_threads', '6'))
+                    cpu_threads=cpu_threads
                 )
                 # Кешируем модель для возможного повторного использования
                 self.model_cache[cache_key] = self.model
                 
-            logging.info(f"Модель Whisper инициализирована: {model_size} на CUDA")
-            
         except Exception as e:
             logging.error(f"Ошибка инициализации модели Whisper: {str(e)}")
-            # Запасной вариант - использовать CPU
-            logging.info("Переключение на резервную CPU модель")
-            self.model = WhisperModel(
-                "medium",  # Используем medium как запасной вариант
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=12  # Увеличиваем количество потоков CPU
-            )
+            logging.error(traceback.format_exc())
+            # Запасной вариант
+            cpu_threads = int(self.config['settings'].get('cpu_threads', '6'))
+            self.model = initialize_whisper_model("medium", "int8", cpu_threads)
 
-    def setup_systray(self):
-        """Настраивает иконку в системном трее с дополнительными опциями"""
-        try:
-            image = Image.open("icon.png")
-            
-            # Создаем меню с выбором режима производительности
-            menu = (
-                item('Режим: Быстрый', self.switch_to_fast_mode, checked=lambda _: self.current_performance_mode == 'fast'),
-                item('Режим: Сбалансированный', self.switch_to_balanced_mode, checked=lambda _: self.current_performance_mode == 'balanced'),
-                item('Режим: Точный', self.switch_to_accurate_mode, checked=lambda _: self.current_performance_mode == 'accurate'),
-                item('Выход', self.quit_app),
-            )
-            
-            self.icon = Icon("STT", image, "Голосовой транскрайбер", menu)
-            threading.Thread(target=self.icon.run, daemon=True).start()
-        except Exception as e:
-            logging.error(f"Ошибка настройки системного трея: {e}")
-            raise  # Пробрасываем ошибку для обработки в конструкторе
-    
     def switch_to_fast_mode(self):
         """Переключает на быстрый режим работы"""
         self.change_performance_mode('fast')
@@ -243,7 +173,7 @@ class TranscriberApp:
         
         # Обновляем конфигурацию
         self.config['settings']['performance_mode'] = mode
-        self._save_config()
+        save_config(self.config)
         
         # Обновляем задержку между символами из настроек режима
         self.char_delay = PERFORMANCE_MODES[mode]['char_delay']
@@ -317,7 +247,8 @@ class TranscriberApp:
                 self.recording_indicator.geometry(f"{indicator_width}x{indicator_height}+{x}+{y}")
                 # Показываем индикатор записи и запускаем мигание
                 self.recording_indicator.deiconify()
-                self.blink_indicator()
+                blink_indicator(self.recording_indicator, self.indicator_on_color, 
+                               self.indicator_off_color, self.is_recording)
             except Exception as e:
                 logging.error(f"Ошибка позиционирования индикатора записи: {e}")
         except Exception as e:
@@ -362,6 +293,8 @@ class TranscriberApp:
         # Проверяем, что запись все еще идет
         if self.is_recording:
             logging.info("Автоматическая остановка записи после обнаружения тишины")
+            # Сохраняем cursor_position перед вызовом stop_recording, так как
+            # self.cursor_position должен сохраниться с момента начала записи
             self.stop_recording(None)
 
     def stop_recording(self, _):
@@ -429,33 +362,45 @@ class TranscriberApp:
         logging.info(f"Тип данных: {audio_np.dtype}")
         
         # Нормализация аудио данных
-        audio_np = audio_np.flatten()
-        
-        # Убедимся, что значения в правильном диапазоне [-1, 1]
-        if np.max(np.abs(audio_np)) > 1.0:
-            audio_np = audio_np / 32767.0
+        audio_np = normalize_audio(audio_np)
         
         try:
             # Получаем параметры из текущего режима производительности
             mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
             beam_size = mode_settings['beam_size']
+            vad_filter = mode_settings['vad_filter']
             
-            segments, info = self.model.transcribe(
-                audio_np,
+            # Транскрибируем аудио
+            text = transcribe_audio(
+                model=self.model,
+                audio_np=audio_np,
                 language='ru',
                 beam_size=beam_size,
-                vad_filter=False,  # Мы используем свой VAD, поэтому отключаем встроенный
+                vad_filter=False  # Используем свой VAD
             )
             
-            logging.info(f"Detected language: {info.language} with probability {info.language_probability}")
-            
-            text = " ".join(segment.text for segment in segments if segment.text)
             logging.info(f"Распознанный текст: {text}")
             
             if text:
+                # Получаем список нежелательных фраз
+                unwanted_phrases = [phrase for key, phrase in self.config['unwanted_phrases'].items() if phrase]
+                
                 # Фильтруем нежелательные фразы перед вставкой
-                text = self.filter_unwanted_phrases(text)
-                self.insert_text(text)
+                text = filter_unwanted_phrases(text, unwanted_phrases)
+                
+                # Выполняем вставку текста
+                input_method = self.config['settings'].get('input_method', 'direct_input')
+                char_delay = float(self.config['settings'].get('char_delay', PERFORMANCE_MODES[self.current_performance_mode]['char_delay']))
+                
+                # Проверяем раскладку клавиатуры перед вставкой
+                ensure_russian_layout()
+                
+                # Вставляем текст (не передаем позицию курсора)
+                insert_text(
+                    text=text,
+                    input_method=input_method,
+                    char_delay=char_delay
+                )
             else:
                 logging.info("Не удалось распознать речь")
             
@@ -539,38 +484,46 @@ class TranscriberApp:
         """
         try:
             # Нормализация аудио данных
-            audio_np = audio_np.flatten().astype(np.float32)
-            
-            # Нормализуем до диапазона [-1, 1]
-            if np.max(np.abs(audio_np)) > 1.0:
-                audio_np = audio_np / 32767.0
+            audio_np = normalize_audio(audio_np)
                 
             # Получаем параметры из текущего режима производительности
             mode_settings = PERFORMANCE_MODES[self.current_performance_mode]
             beam_size = mode_settings['beam_size']
             
-            # Настраиваем параметры транскрипции
-            params = {
-                'language': 'ru',
-                'beam_size': beam_size,
-                'vad_filter': False,  # Мы используем собственный VAD
-                'initial_prompt': "Это текст на русском языке."
-            }
-            
-            segments, info = self.model.transcribe(audio_np, **params)
-            
-            # Сбор результатов
-            text = " ".join(segment.text for segment in segments if segment.text)
+            # Транскрибируем аудио
+            text = transcribe_audio(
+                model=self.model,
+                audio_np=audio_np,
+                language='ru',
+                beam_size=beam_size,
+                vad_filter=False
+            )
             
             logging.info(f"Распознано (до фильтрации): {text}")
             
-            # Фильтруем нежелательные фразы
-            text = self.filter_unwanted_phrases(text)
-            
-            logging.info(f"Распознано (после фильтрации): {text}")
-            
             if text:
-                self.insert_text(text)
+                # Получаем список нежелательных фраз
+                unwanted_phrases = [phrase for key, phrase in self.config['unwanted_phrases'].items() if phrase]
+                
+                # Фильтруем нежелательные фразы
+                text = filter_unwanted_phrases(text, unwanted_phrases)
+                
+                logging.info(f"Распознано (после фильтрации): {text}")
+                
+                # Выполняем вставку текста
+                input_method = self.config['settings'].get('input_method', 'direct_input')
+                char_delay = float(self.config['settings'].get('char_delay', PERFORMANCE_MODES[self.current_performance_mode]['char_delay']))
+                
+                # Проверяем раскладку клавиатуры перед вставкой
+                ensure_russian_layout()
+                
+                # Вставляем текст (не передаем позицию курсора)
+                insert_text(
+                    text=text,
+                    input_method=input_method,
+                    char_delay=char_delay
+                )
+                
                 return text
             else:
                 logging.info("Не удалось распознать речь")
@@ -599,8 +552,10 @@ class TranscriberApp:
             self._toggle_lock = True
             
             if not self.is_recording:
+                # Начинаем запись и сохраняем текущую позицию курсора
                 self.start_recording(event)
             else:
+                # Останавливаем запись, позиция курсора уже сохранена
                 logging.info("Останавливаем запись по горячей клавише")
                 self.is_recording = False  # Явно устанавливаем флаг перед вызовом stop_recording
                 self.stop_recording(event)
@@ -613,293 +568,12 @@ class TranscriberApp:
         if self.is_recording:
             max_seconds = int(self.config['settings'].get('max_recording_seconds', '120'))
             logging.info(f"Автоматическая остановка записи по истечении {max_seconds} секунд")
+            # cursor_position уже сохранен с момента начала записи
             self.stop_recording(None)
 
     def run(self):
         """Запускает основной цикл приложения"""
         self.root.mainloop()
-
-    def ensure_russian_layout(self):
-        """Проверяет раскладку клавиатуры активного окна и логирует предупреждение, если она не русская."""
-        if not WIN32_AVAILABLE:
-            logging.warning("Проверка раскладки недоступна: pywin32 не установлен.")
-            return
-
-        try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            if hwnd == 0:
-                logging.warning("Не удалось получить активное окно для проверки раскладки.")
-                return
-                
-            thread_id = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, 0)
-            layout_id = ctypes.windll.user32.GetKeyboardLayout(thread_id)
-            # HKL (Keyboard Layout Handle) младшее слово содержит Language ID.
-            # 0x0419 - Русский
-            lang_id = layout_id & 0xFFFF
-            
-            if lang_id != 0x0419:  # Не русский язык
-                logging.warning(f"Обнаружена не русская раскладка клавиатуры (ID: {hex(lang_id)}). Ввод текста может быть некорректным.")
-            else:
-                logging.info("Обнаружена русская раскладка клавиатуры.")
-                
-        except Exception as e:
-            logging.error(f"Ошибка при проверке раскладки клавиатуры: {e}")
-
-    def setup_recording_indicator(self):
-        """
-        Создаёт и настраивает индикатор записи - мигающий красный прямоугольник,
-        показывающий, что идёт запись голоса.
-        """
-        # Создаём всплывающее окно
-        self.recording_indicator = Toplevel(self.root)
-        self.recording_indicator.overrideredirect(True)  # Убираем рамки окна
-        self.recording_indicator.attributes('-topmost', True)  # Всегда поверх других окон
-        
-        # Задаем размер и начальный цвет фона
-        self.indicator_width = 20
-        self.indicator_height = 5
-        self.indicator_on_color = "red"
-        # Используем системный цвет фона окна как цвет "выключения" для мигания
-        # Чтобы сделать его полупрозрачным или использовать прозрачность, 
-        # можно установить цвет 'black' и использовать '-transparentcolor'
-        self.indicator_off_color = self.root.cget('bg') # Или 'black' для прозрачности
-        # self.recording_indicator.attributes('-transparentcolor', 'black')
-        
-        self.recording_indicator.configure(bg=self.indicator_on_color)
-        # Начальная геометрия (позиция будет обновляться при старте записи)
-        self.recording_indicator.geometry(f"{self.indicator_width}x{self.indicator_height}+0+0") 
-        
-        self.recording_indicator.withdraw()  # Изначально скрываем индикатор
-
-    def blink_indicator(self):
-        # Функция мигания красного прямоугольника
-        if not self.is_recording:
-            # Убедимся, что индикатор скрыт и имеет цвет "включено" для следующего показа
-            self.recording_indicator.withdraw()
-            self.recording_indicator.configure(bg=self.indicator_on_color) 
-            return
-            
-        # Проверяем, видимо ли окно (на всякий случай)
-        if not self.recording_indicator.winfo_viewable():
-             self.recording_indicator.configure(bg=self.indicator_on_color)
-             return # Не мигаем, если скрыто
-
-        try:
-            current_color = self.recording_indicator.cget("bg")
-            new_color = self.indicator_off_color if current_color == self.indicator_on_color else self.indicator_on_color
-            self.recording_indicator.configure(bg=new_color)
-            # Планируем следующее мигание
-            self.recording_indicator.after(500, self.blink_indicator)
-        except TclError as e:
-            # Окно может быть уже уничтожено
-            logging.warning(f"Ошибка при мигании индикатора (возможно, окно закрыто): {e}")
-
-    # Методы вставки текста
-    def insert_text(self, text):
-        """Вставка текста без использования буфера обмена"""
-        try:
-            # Убираем лишние пробелы и добавляем один пробел в конце
-            text = text.rstrip() + ' '
-            logging.info(f"Текст для вставки: '{text}'")
-            # Активируем окно, симулируя клик для восстановления фокуса ввода
-            pyautogui.click()
-            
-            # Используем метод ввода из конфигурации
-            if self.config['settings'].get('input_method', 'direct_input') == 'direct_input' and WIN32_AVAILABLE:
-                self.insert_via_direct_input(text)
-            else:
-                self.insert_via_keyboard(text)
-        except Exception as e:
-            logging.error(f"Ошибка вставки текста: {e}")
-
-    def insert_via_keyboard(self, text):
-        """Вставка текста через эмуляцию клавиатуры с батчингом"""
-        try:
-            logging.info("Вставка текста через эмуляцию клавиатуры")
-            kb = Controller()
-            
-            # Разбиваем на блоки для более эффективного ввода
-            batch_size = 5  # Вводим по 5 символов за раз
-            for i in range(0, len(text), batch_size):
-                batch = text[i:i+batch_size]
-                kb.type(batch)
-                # Небольшая задержка между батчами
-                time.sleep(self.char_delay)
-                
-            logging.info(f"Текст '{text}' вставлен через эмуляцию клавиатуры")
-        except Exception as e:
-            logging.error(f"Ошибка вставки текста через клавиатуру: {e}")
-
-    def insert_via_direct_input(self, text):
-        """Вставка текста напрямую через WinAPI с оптимизацией батчинга"""
-        try:
-            if not WIN32_AVAILABLE:
-                raise Exception("WinAPI недоступен")
-            
-            hwnd = win32gui.GetForegroundWindow()
-            if hwnd == 0:
-                raise Exception("Не удалось получить активное окно")
-            
-            # Используем батчинг для более эффективной вставки
-            batch_size = 5  # Размер пакета символов
-            for i in range(0, len(text), batch_size):
-                batch = text[i:i+batch_size]
-                # Отправляем пакет символов
-                for char in batch:
-                    win32api.SendMessage(hwnd, win32con.WM_CHAR, ord(char), 0)
-                # Задержка между батчами
-                time.sleep(self.char_delay)
-            
-            logging.info(f"Текст '{text}' вставлен через WinAPI")
-        except Exception as e:
-            logging.error(f"Ошибка прямого ввода текста: {e}")
-            # В случае ошибки используем метод с клавиатурой
-            self.insert_via_keyboard(text)
-
-    def get_model_size_from_config(self):
-        """Получает размер модели из конфигурации или переменной окружения"""
-        # Сначала проверяем переменную окружения
-        model_size = os.environ.get("WHISPER_MODEL_SIZE")
-        if model_size:
-            logging.info(f"Используется размер модели из переменной окружения: {model_size}")
-            return model_size
-        
-        # Затем проверяем конфигурацию
-        try:
-            if hasattr(self, 'config') and 'settings' in self.config and 'model_size' in self.config['settings']:
-                model_size = self.config['settings']['model_size']
-                return model_size
-        except Exception as e:
-            logging.error(f"Ошибка чтения размера модели из конфигурации: {e}")
-        
-        # По умолчанию используем large-v3-turbo
-        return "large-v3-turbo"
-
-    def load_or_create_config(self):
-        """Загружает или создает файл конфигурации с обработкой ошибок"""
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
-        
-        try:
-            if os.path.exists(config_path):
-                self.config.read(config_path, encoding='utf-8')
-                
-                # Загружаем настройки, если секция существует
-                if 'settings' in self.config:
-                    config_settings = self.config['settings']
-                    
-                    # Используем get с значениями по умолчанию для безопасного извлечения
-                    self.input_method = config_settings.get('input_method', 'keyboard')
-                    self.char_delay = float(config_settings.get('char_delay', '0.03'))
-                    self.remove_duplicates = config_settings.getboolean('remove_duplicates', True)
-                    self.max_recording_seconds = int(config_settings.get('max_recording_seconds', '120'))
-                    self.hotkey = config_settings.get('hotkey', 'f8')
-                    self.current_performance_mode = config_settings.get('performance_mode', 'balanced')
-                    
-                    logging.info(f"Загружены настройки: метод ввода={self.input_method}, "
-                                 f"задержка={self.char_delay}, "
-                                 f"удаление дубликатов={self.remove_duplicates}, "
-                                 f"горячая клавиша={self.hotkey}, "
-                                 f"режим производительности={self.current_performance_mode}")
-                else:
-                    self._set_default_settings()
-            else:
-                # Создаем конфигурацию по умолчанию
-                self._set_default_settings()
-                self._save_config()
-        except Exception as e:
-            logging.error(f"Ошибка загрузки конфигурации: {e}")
-            self._set_default_settings()
-
-    def _set_default_settings(self):
-        """Устанавливает настройки по умолчанию"""
-        if 'settings' not in self.config:
-            self.config['settings'] = {}
-        
-        # Устанавливаем прямой ввод как метод по умолчанию
-        self.input_method = 'direct_input' 
-        self.char_delay = 0.02  # Уменьшаем задержку для более быстрого ввода
-        self.remove_duplicates = True
-        self.max_recording_seconds = 60  # Уменьшаем до 1 минуты для более быстрой обработки
-        self.hotkey = 'f8'  # Горячая клавиша по умолчанию
-        self.current_performance_mode = 'balanced'  # Режим по умолчанию
-        
-        self.config['settings']['input_method'] = self.input_method
-        self.config['settings']['char_delay'] = str(self.char_delay)
-        self.config['settings']['remove_duplicates'] = str(self.remove_duplicates)
-        self.config['settings']['model_size'] = 'large-v3'  # Используем large-v3 для лучшего баланса
-        self.config['settings']['language'] = 'ru'
-        self.config['settings']['max_recording_seconds'] = str(self.max_recording_seconds)
-        self.config['settings']['hotkey'] = self.hotkey
-        self.config['settings']['performance_mode'] = self.current_performance_mode
-        self.config['settings']['vad_threshold'] = '0.005'
-        self.config['settings']['batch_size'] = '5'
-        self.config['settings']['max_workers'] = '2'
-        self.config['settings']['cpu_threads'] = '8'  # Увеличиваем для лучшей производительности
-        
-        # Добавляем секцию для нежелательных фраз, если её нет
-        if 'unwanted_phrases' not in self.config:
-            self.config['unwanted_phrases'] = {}
-            self.config['unwanted_phrases']['phrase1'] = "Субтитры создавал DimaTorzok"
-            self.config['unwanted_phrases']['phrase2'] = "Продолжение следует..."
-            self.config['unwanted_phrases']['phrase3'] = "Редактор субтитров А.Семкин Корректор А.Егорова"
-            self.config['unwanted_phrases']['phrase4'] = "Текст на русском языке"
-            self.config['unwanted_phrases']['phrase5'] = "Субтитры сделал DimaTorzok"
-            self.config['unwanted_phrases']['phrase6'] = "Редактор субтитров М.Лосева Корректор А.Егорова"
-            self.config['unwanted_phrases']['phrase7'] = "Текст на английском."
-            self.config['unwanted_phrases']['phrase8'] = "Редактор субтитров А.Синецкая Корректор А.Егорова"
-            self.config['unwanted_phrases']['phrase9'] = "Редактор субтитров Т.Горелова Корректор А.Егорова"
-            self.config['unwanted_phrases']['phrase10'] = "Редактор субтитров Е.Жукова Корректор А.Егорова"
-            self.config['unwanted_phrases']['phrase11'] = "Смотрите продолжение во второй части видео"
-            self.config['unwanted_phrases']['phrase12'] = "Смотрите продолжение в следующей части" 
-            self.config['unwanted_phrases']['phrase13'] = "Смотрите продолжение в следующей части видео"
-            self.config['unwanted_phrases']['phrase14'] = "Смотрите продолжение в 4 части видео"
-            self.config['unwanted_phrases']['phrase15'] = "Смотрите продолжение в следующей серии..."
-            self.config['unwanted_phrases']['phrase16'] = "Смотрите продолжение во второй части"
-            self.config['unwanted_phrases']['phrase17'] = "Спасибо за субтитры!"
-            self.config['unwanted_phrases']['phrase18'] = "Субтитры добавил DimaTorzok"
-            self.config['unwanted_phrases']['phrase19'] = "Редактор субтитров А.Семкин"
-            self.config['unwanted_phrases']['phrase20'] = "Спасибо Спасибо"
-            self.config['unwanted_phrases']['phrase21'] = "Это текст на русском языке"         
-            self.config['unwanted_phrases']['phrase22'] = "Субтитры подогнал «Симон»"
-
-    def _save_config(self):
-        """Сохраняет конфигурацию в файл"""
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                self.config.write(f)
-        except Exception as e:
-            logging.error(f"Ошибка сохранения конфигурации: {e}")
-
-    def filter_unwanted_phrases(self, text):
-        """Удаляет нежелательные фразы из распознанного текста"""
-        try:
-            unwanted_phrases = []
-            # Загружаем фразы из конфигурации, если секция существует
-            if 'unwanted_phrases' in self.config:
-                unwanted_phrases = [phrase for key, phrase in self.config['unwanted_phrases'].items() if phrase]
-            
-            # Если список пуст, ничего не делаем
-            if not unwanted_phrases:
-                return text
-
-            # Удаляем каждую нежелательную фразу из текста
-            original_text = text
-            for phrase in unwanted_phrases:
-                # Используем re.escape для корректной обработки спецсимволов в фразах
-                text = text.replace(phrase, "")
-            
-            # Удаляем лишние пробелы, которые могли образоваться после удаления фраз
-            text = re.sub(r'\s+', ' ', text).strip()
-            
-            # Логируем, если были произведены изменения
-            if original_text != text:
-                logging.info(f"Удалены нежелательные фразы. Было: '{original_text}' Стало: '{text}'")
-            
-            return text
-        except Exception as e:
-            logging.error(f"Ошибка при фильтрации нежелательных фраз: {e}")
-            return text  # Возвращаем оригинальный текст в случае ошибки
 
     def register_hotkey(self):
         """Регистрирует горячую клавишу из конфигурации"""
@@ -919,19 +593,6 @@ class TranscriberApp:
             self.hotkey = 'f8'
             keyboard.on_press_key('f8', self.toggle_recording)
 
-    def update_settings(self):
-        """Обновляет настройки приложения и применяет их"""
-        try:
-            # Сохраняем конфигурацию в файл
-            self._save_config()
-            
-            # Перерегистрируем горячую клавишу, если она изменилась
-            self.register_hotkey()
-            
-            logging.info("Настройки успешно обновлены")
-        except Exception as e:
-            logging.error(f"Ошибка при обновлении настроек: {e}")
-
 if __name__ == "__main__":
     # Скрываем консоль при запуске через python.exe
     if WIN32_AVAILABLE and not hasattr(sys, 'frozen'):
@@ -942,5 +603,6 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Ошибка при скрытии консоли: {e}")
     
+    # Запускаем приложение
     app = TranscriberApp()
     app.run() 
